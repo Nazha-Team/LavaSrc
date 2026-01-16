@@ -1,4 +1,3 @@
-
 package com.github.topi314.lavasrc.spotify;
 
 import com.github.topi314.lavalyrics.AudioLyricsManager;
@@ -54,6 +53,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	public static final int PLAYLIST_MAX_PAGE_ITEMS = 100;
 	public static final int ALBUM_MAX_PAGE_ITEMS = 50;
 	public static final String API_BASE = "https://api.spotify.com/v1/";
+	public static final String PARTNER_API_BASE = "https://api-partner.spotify.com/pathfinder/v1/";
 	public static final String CLIENT_API_BASE = "https://spclient.wg.spotify.com/";
 	private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.178 Spotify/1.2.65.255 Safari/537.36";
 	public static final Set<AudioSearchResult.Type> SEARCH_TYPES = Set.of(AudioSearchResult.Type.ALBUM, AudioSearchResult.Type.ARTIST, AudioSearchResult.Type.PLAYLIST, AudioSearchResult.Type.TRACK);
@@ -68,6 +68,10 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	private boolean resolveArtistsInSearch = true;
 	private boolean preferAnonymousToken = false;
 	
+	// NEW: Partner API support
+	private boolean usePartnerAPI = false;
+	private String partnerClientId;
+	private String partnerToken;
 
 	public SpotifySourceManager(String[] providers, String clientId, String clientSecret, String countryCode, AudioPlayerManager audioPlayerManager) {
 		this(clientId, clientSecret, null, countryCode, unused -> audioPlayerManager, new DefaultMirroringAudioTrackResolver(providers));
@@ -103,6 +107,14 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		}
 		this.countryCode = countryCode;
 		this.preferAnonymousToken = preferAnonymousToken;
+	}
+
+	// NEW: Methods for Partner API
+	public void setPartnerAPI(boolean usePartnerAPI, String partnerClientId, String partnerToken) {
+		this.usePartnerAPI = usePartnerAPI;
+		this.partnerClientId = partnerClientId;
+		this.partnerToken = partnerToken;
+		log.info("Partner API mode: {}", usePartnerAPI ? "enabled" : "disabled");
 	}
 
 	public void setPlaylistPageLimit(int playlistPageLimit) {
@@ -254,7 +266,6 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 				return this.getRecommendations(identifier.substring(RECOMMENDATIONS_PREFIX.length()).trim(), preview);
 			}
 
-			// If the identifier is a share URL, we need to follow the redirect to find out the real url behind it
 			if (identifier.startsWith(SHARE_URL)) {
 				var request = new HttpHead(identifier);
 				request.setConfig(RequestConfig.custom().setRedirectsEnabled(false).build());
@@ -294,18 +305,35 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		return null;
 	}
 
+	// MODIFIED: Support both regular API and Partner API
 	public JsonBrowser getJson(String uri, boolean anonymous, boolean preferAnonymous) throws IOException {
 		var request = new HttpGet(uri);
-		var accessToken = anonymous ? this.tokenTracker.getAnonymousAccessToken() : this.tokenTracker.getAccessToken(preferAnonymous);
-		request.addHeader("Authorization", "Bearer " + accessToken);
+		
+		if (usePartnerAPI && partnerToken != null && !partnerToken.isEmpty()) {
+			// Use Partner API authentication
+			request.addHeader("Authorization", "Bearer " + partnerToken);
+			request.addHeader("Client-Token", partnerClientId);
+			request.addHeader("User-Agent", USER_AGENT);
+			log.debug("Using Partner API for request: {}", uri);
+		} else {
+			// Use standard OAuth token
+			var accessToken = anonymous ? this.tokenTracker.getAnonymousAccessToken() : this.tokenTracker.getAccessToken(preferAnonymous);
+			request.addHeader("Authorization", "Bearer " + accessToken);
+		}
+		
 		return LavaSrcTools.fetchResponseAsJson(this.httpInterfaceManager.getInterface(), request);
+	}
+
+	// MODIFIED: Add Partner API endpoint support
+	private String getApiBase() {
+		return usePartnerAPI ? PARTNER_API_BASE : API_BASE;
 	}
 
 	private AudioSearchResult getAutocomplete(String query, Set<AudioSearchResult.Type> types) throws IOException {
 		if (types.isEmpty()) {
 			types = SEARCH_TYPES;
 		}
-		var url = API_BASE + "search?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8) + "&type=" + types.stream().map(AudioSearchResult.Type::getName).collect(Collectors.joining(","));
+		var url = getApiBase() + "search?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8) + "&type=" + types.stream().map(AudioSearchResult.Type::getName).collect(Collectors.joining(","));
 		var json = this.getJson(url, false, false);
 		if (json == null) {
 			return AudioSearchResult.EMPTY;
@@ -356,14 +384,14 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getSearch(String query, boolean preview) throws IOException {
-		var json = this.getJson(API_BASE + "search?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8) + "&type=track", false, false);
+		var json = this.getJson(getApiBase() + "search?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8) + "&type=track", false, false);
 		if (json == null || json.get("tracks").get("items").values().isEmpty()) {
 			return AudioReference.NO_TRACK;
 		}
 
 		if (this.resolveArtistsInSearch) {
 			var artistIds = json.get("tracks").get("items").values().stream().map(track -> track.get("artists").index(0).get("id").text()).collect(Collectors.joining(","));
-			var artistJson = this.getJson(API_BASE + "artists?ids=" + artistIds, false, false);
+			var artistJson = this.getJson(getApiBase() + "artists?ids=" + artistIds, false, false);
 			if (artistJson != null) {
 				for (var artist : artistJson.get("artists").values()) {
 					for (var track : json.get("tracks").get("items").values()) {
@@ -409,7 +437,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 			}
 			
 		}
-		var json = this.getJson(API_BASE + "recommendations?" + query, false, false);
+		var json = this.getJson(getApiBase() + "recommendations?" + query, false, false);
 		if (json == null || json.get("tracks").values().isEmpty()) {
 			return AudioReference.NO_TRACK;
 		}
@@ -418,26 +446,25 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getAlbum(String id, boolean preview) throws IOException {
-		var json = this.getJson(API_BASE + "albums/" + id, false, this.preferAnonymousToken);
+		var json = this.getJson(getApiBase() + "albums/" + id, false, this.preferAnonymousToken);
 		if (json == null) {
 			return AudioReference.NO_TRACK;
 		}
 
-		var artistJson = this.getJson(API_BASE + "artists/" + json.get("artists").index(0).get("id").text(), false, this.preferAnonymousToken);
+		var artistJson = this.getJson(getApiBase() + "artists/" + json.get("artists").index(0).get("id").text(), false, this.preferAnonymousToken);
 		if (artistJson == null) {
 			artistJson = JsonBrowser.newMap();
 		}
-
 
 		var tracks = new ArrayList<AudioTrack>();
 		JsonBrowser page;
 		var offset = 0;
 		var pages = 0;
 		do {
-			page = this.getJson(API_BASE + "albums/" + id + "/tracks?limit=" + ALBUM_MAX_PAGE_ITEMS + "&offset=" + offset, false, this.preferAnonymousToken);
+			page = this.getJson(getApiBase() + "albums/" + id + "/tracks?limit=" + ALBUM_MAX_PAGE_ITEMS + "&offset=" + offset, false, this.preferAnonymousToken);
 			offset += ALBUM_MAX_PAGE_ITEMS;
 
-			var tracksPage = this.getJson(API_BASE + "tracks/?ids=" + page.get("items").values().stream().map(track -> track.get("id").text()).collect(Collectors.joining(",")), false, this.preferAnonymousToken);
+			var tracksPage = this.getJson(getApiBase() + "tracks/?ids=" + page.get("items").values().stream().map(track -> track.get("id").text()).collect(Collectors.joining(",")), false, this.preferAnonymousToken);
 
 			for (var track : tracksPage.get("tracks").values()) {
 				var albumJson = JsonBrowser.newMap();
@@ -462,10 +489,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getPlaylist(String id, boolean preview) throws IOException {
-		// autogenerated playlists seem to start with "37i9dQZ" and are not accessible without an anonymous token lol
 		var anonymous = id.startsWith("37i9dQZ");
 
-		var json = this.getJson(API_BASE + "playlists/" + id, anonymous, this.preferAnonymousToken);
+		var json = this.getJson(getApiBase() + "playlists/" + id, anonymous, this.preferAnonymousToken);
 		if (json == null) {
 			return AudioReference.NO_TRACK;
 		}
@@ -475,7 +501,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		var offset = 0;
 		var pages = 0;
 		do {
-			page = this.getJson(API_BASE + "playlists/" + id + "/tracks?limit=" + PLAYLIST_MAX_PAGE_ITEMS + "&offset=" + offset, anonymous, this.preferAnonymousToken);
+			page = this.getJson(getApiBase() + "playlists/" + id + "/tracks?limit=" + PLAYLIST_MAX_PAGE_ITEMS + "&offset=" + offset, anonymous, this.preferAnonymousToken);
 			offset += PLAYLIST_MAX_PAGE_ITEMS;
 
 			for (var value : page.get("items").values()) {
@@ -494,12 +520,12 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getArtist(String id, boolean preview) throws IOException {
-		var json = this.getJson(API_BASE + "artists/" + id, false, this.preferAnonymousToken);
+		var json = this.getJson(getApiBase() + "artists/" + id, false, this.preferAnonymousToken);
 		if (json == null) {
 			return AudioReference.NO_TRACK;
 		}
 
-		var tracksJson = this.getJson(API_BASE + "artists/" + id + "/top-tracks?market=" + this.countryCode, false, this.preferAnonymousToken);
+		var tracksJson = this.getJson(getApiBase() + "artists/" + id + "/top-tracks?market=" + this.countryCode, false, this.preferAnonymousToken);
 		if (tracksJson == null || tracksJson.get("tracks").values().isEmpty()) {
 			return AudioReference.NO_TRACK;
 		}
@@ -512,12 +538,12 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getTrack(String id, boolean preview) throws IOException {
-		var json = this.getJson(API_BASE + "tracks/" + id, false, this.preferAnonymousToken);
+		var json = this.getJson(getApiBase() + "tracks/" + id, false, this.preferAnonymousToken);
 		if (json == null) {
 			return AudioReference.NO_TRACK;
 		}
 
-		var artistJson = this.getJson(API_BASE + "artists/" + json.get("artists").index(0).get("id").text(), false, this.preferAnonymousToken);
+		var artistJson = this.getJson(getApiBase() + "artists/" + json.get("artists").index(0).get("id").text(), false, this.preferAnonymousToken);
 		if (artistJson != null) {
 			json.get("artists").index(0).put("images", artistJson.get("images"));
 		}
