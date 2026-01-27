@@ -19,6 +19,7 @@ public class SourcesConfig {
 	private boolean tidal = false;
 	private boolean ytdlp = false;
 	private boolean jiosaavn = false;
+	private boolean pandora = false;
 
 	public boolean isSpotify() {
 		return this.spotify;
@@ -50,6 +51,13 @@ public class SourcesConfig {
 
 	public void setYandexMusic(boolean yandexMusic) {
 		this.yandexMusic = yandexMusic;
+	}
+	public boolean isPandora() {
+		return this.pandora;
+	}
+
+	public void setPandora(boolean pandora) {
+		this.pandora = pandora;
 	}
 
 	public boolean isFloweryTTS() {
