@@ -71,6 +71,7 @@ public class SpotifyTokenTracker {
 		this.sourceManager = source;
 		this.clientId = clientId;
 		this.clientSecret = clientSecret;
+		// customTokenEndpoint is ignored - partner token system doesn't need it
 
 		if (!hasValidCredentials()) {
 			log.debug("Missing/invalid credentials, will use partner token if available.");
@@ -88,6 +89,16 @@ public class SpotifyTokenTracker {
 		this.clientSecret = clientSecret;
 		this.accessToken = null;
 		this.expires = null;
+	}
+
+	/**
+	 * For backward compatibility - this is no longer used with partner token system
+	 * @deprecated customTokenEndpoint is no longer needed
+	 */
+	@Deprecated
+	public void setCustomTokenEndpoint(String customTokenEndpoint) {
+		// No-op for backward compatibility
+		log.debug("setCustomTokenEndpoint called but is deprecated and ignored with partner token system");
 	}
 
 	private boolean hasValidCredentials() {
