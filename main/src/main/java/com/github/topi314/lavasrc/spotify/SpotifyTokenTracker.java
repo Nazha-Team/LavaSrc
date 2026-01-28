@@ -1,38 +1,53 @@
 package com.github.topi314.lavasrc.spotify;
 
 import com.github.topi314.lavasrc.LavaSrcTools;
+import com.sedmelluq.discord.lavaplayer.tools.JsonBrowser;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
-import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
 import org.apache.http.message.BasicNameValuePair;
-import org.apache.http.util.EntityUtils;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
-import java.util.regex.Pattern;
+import java.util.Map;
 
 public class SpotifyTokenTracker {
 	private static final Logger log = LoggerFactory.getLogger(SpotifyTokenTracker.class);
-
-	private static final Pattern SECRET_PATTERN = Pattern.compile("\"secret\":\\[(\\d+(?:,\\d+)+)]");
+	
+	private static final String SPOTIFY_PARTNER_API_URL = "https://api-partner.spotify.com/pathfinder/v2/query";
+	private static final String TOKEN_REFRESH_MARGIN_MS = "300000"; // 5 minutes in milliseconds
+	
+	// Query definitions for Partner API
+	private static final Map<String, QueryDefinition> QUERIES = new HashMap<>();
+	
+	static {
+		QUERIES.put("getTrack", new QueryDefinition(
+			"getTrack",
+			"612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+		));
+		QUERIES.put("getAlbum", new QueryDefinition(
+			"getAlbum",
+			"b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
+		));
+		QUERIES.put("getPlaylist", new QueryDefinition(
+			"fetchPlaylist",
+			"bb67e0af06e8d6f52b531f97468ee4acd44cd0f82b988e15c2ea47b1148efc77"
+		));
+		QUERIES.put("getArtist", new QueryDefinition(
+			"queryArtistOverview",
+			"35648a112beb1794e39ab931365f6ae4a8d45e65396d641eeda94e4003d41497"
+		));
+		QUERIES.put("searchDesktop", new QueryDefinition(
+			"searchDesktop",
+			"fcad5a3e0d5af727fb76966f06971c19cfa2275e6ff7671196753e008611873c"
+		));
+	}
 
 	private final SpotifySourceManager sourceManager;
 
@@ -41,9 +56,8 @@ public class SpotifyTokenTracker {
 	private String accessToken;
 	private Instant expires;
 
-	private String customTokenEndpoint;
-	private String anonymousAccessToken;
-	private Instant anonymousExpires;
+	private String partnerToken;
+	private Instant partnerTokenExpiry;
 
 	private String spDc;
 	private String accountAccessToken;
@@ -57,10 +71,9 @@ public class SpotifyTokenTracker {
 		this.sourceManager = source;
 		this.clientId = clientId;
 		this.clientSecret = clientSecret;
-		this.customTokenEndpoint = customTokenEndpoint;
 
 		if (!hasValidCredentials()) {
-			log.debug("Missing/invalid credentials, falling back to public token.");
+			log.debug("Missing/invalid credentials, will use partner token if available.");
 		}
 
 		this.spDc = spDc;
@@ -77,21 +90,13 @@ public class SpotifyTokenTracker {
 		this.expires = null;
 	}
 
-	public void setCustomTokenEndpoint(String customTokenEndpoint) {
-		this.customTokenEndpoint = customTokenEndpoint;
-		this.anonymousAccessToken = null;
-		this.anonymousExpires = null;
-		this.accountAccessToken = null;
-		this.accountAccessTokenExpire = null;
-	}
-
 	private boolean hasValidCredentials() {
 		return clientId != null && !clientId.isEmpty() && clientSecret != null && !clientSecret.isEmpty();
 	}
 
-	public String getAccessToken(boolean preferAnonymousToken) throws IOException {
-		if (preferAnonymousToken || !hasValidCredentials()) {
-			return this.getAnonymousAccessToken();
+	public String getAccessToken(boolean preferPartnerToken) throws IOException {
+		if (preferPartnerToken || !hasValidCredentials()) {
+			return this.getPartnerToken();
 		}
 		if (this.accessToken == null || this.expires == null || this.expires.isBefore(Instant.now())) {
 			synchronized (this) {
@@ -121,32 +126,58 @@ public class SpotifyTokenTracker {
 		expires = Instant.now().plusSeconds(json.get("expires_in").asLong(0));
 	}
 
-	public String getAnonymousAccessToken() throws IOException {
-		if (this.anonymousAccessToken == null || this.anonymousExpires == null || this.anonymousExpires.isBefore(Instant.now())) {
+	/**
+	 * Get Partner Token - replaces the old anonymous token system
+	 * This uses the Spotify Partner API for token retrieval
+	 */
+	public String getPartnerToken() throws IOException {
+		if (this.partnerToken == null || this.partnerTokenExpiry == null || 
+		    this.partnerTokenExpiry.isBefore(Instant.now().plusMillis(Long.parseLong(TOKEN_REFRESH_MARGIN_MS)))) {
 			synchronized (this) {
-				if (this.anonymousAccessToken == null || this.anonymousExpires == null || this.anonymousExpires.isBefore(Instant.now())) {
-					log.debug("Anonymous access token is invalid or expired, refreshing token...");
-					this.refreshAnonymousAccessToken();
+				if (this.partnerToken == null || this.partnerTokenExpiry == null || 
+				    this.partnerTokenExpiry.isBefore(Instant.now().plusMillis(Long.parseLong(TOKEN_REFRESH_MARGIN_MS)))) {
+					log.debug("Partner token is invalid or expired, refreshing token...");
+					this.refreshPartnerToken();
 				}
 			}
 		}
-		return this.anonymousAccessToken;
+		return this.partnerToken;
 	}
 
-	private void refreshAnonymousAccessToken() throws IOException {
-		var request = new HttpGet(generateGetAccessTokenURL());
-
+	/**
+	 * Refresh Partner Token using the client token endpoint
+	 * This is a simpler approach that doesn't require secret extraction
+	 */
+	private void refreshPartnerToken() throws IOException {
+		// Use the client token endpoint - no authentication required
+		var request = new HttpGet("https://clienttoken.spotify.com/v1/clienttoken");
+		request.addHeader("Accept", "application/json");
+		
 		var json = LavaSrcTools.fetchResponseAsJson(sourceManager.getHttpInterface(), request);
 		if (json == null) {
-			throw new RuntimeException("No response from Spotify API while fetching anonymous access token.");
+			throw new RuntimeException("No response from Spotify Partner API while fetching partner token.");
 		}
+		
+		// Check if we got a granted_token response
+		if (!json.get("granted_token").isNull()) {
+			var grantedToken = json.get("granted_token");
+			partnerToken = grantedToken.get("token").text();
+			
+			// Calculate expiry time
+			long expiresInSeconds = grantedToken.get("expires_after_seconds").asLong(3600);
+			partnerTokenExpiry = Instant.now().plusSeconds(expiresInSeconds);
+			
+			log.debug("Partner token refreshed successfully. Expires in {} seconds", expiresInSeconds);
+			return;
+		}
+		
+		// Fallback to old format if available
 		if (!json.get("error").isNull()) {
 			var error = json.get("error").text();
-			throw new RuntimeException("Error while fetching anonymous access token: " + error);
+			throw new RuntimeException("Error while fetching partner token: " + error);
 		}
 
-		anonymousAccessToken = json.get("accessToken").text();
-		anonymousExpires = Instant.ofEpochMilli(json.get("accessTokenExpirationTimestampMs").asLong(0));
+		throw new RuntimeException("Unable to parse partner token response");
 	}
 
 	public void setSpDc(String spDc) {
@@ -168,7 +199,7 @@ public class SpotifyTokenTracker {
 	}
 
 	public void refreshAccountAccessToken() throws IOException {
-		var request = new HttpGet(generateGetAccessTokenURL());
+		var request = new HttpGet("https://open.spotify.com/get_access_token?reason=transport&productType=web_player");
 		request.addHeader("App-Platform", "WebPlayer");
 		request.addHeader("Cookie", "sp_dc=" + this.spDc);
 
@@ -194,137 +225,93 @@ public class SpotifyTokenTracker {
 		return this.spDc != null && !this.spDc.isEmpty();
 	}
 
-	private String generateGetAccessTokenURL() throws IOException {
-		if (this.customTokenEndpoint != null && !this.customTokenEndpoint.isBlank()) {
-			return this.customTokenEndpoint;
+	/**
+	 * Make a request to the Spotify Partner API
+	 * This replaces the need for the internal API requests with secret extraction
+	 */
+	public JsonBrowser makePartnerApiRequest(String queryName, Map<String, Object> variables) throws IOException {
+		QueryDefinition query = QUERIES.get(queryName);
+		if (query == null) {
+			throw new IllegalArgumentException("Unknown query: " + queryName);
 		}
 
-		var secret = requestSecret();
-		if (secret == null) {
-			throw new IOException("Failed to retrieve secret from Spotify.");
+		String token = getPartnerToken();
+		
+		var request = new HttpPost(SPOTIFY_PARTNER_API_URL);
+		request.addHeader("Authorization", "Bearer " + token);
+		request.addHeader("App-Platform", "WebPlayer");
+		request.addHeader("Spotify-App-Version", "1.2.81.104.g225ec0e6");
+		request.addHeader("Content-Type", "application/json; charset=utf-8");
+		
+		// Build request body
+		Map<String, Object> body = new HashMap<>();
+		body.put("variables", variables);
+		body.put("operationName", query.name);
+		
+		Map<String, Object> extensions = new HashMap<>();
+		Map<String, Object> persistedQuery = new HashMap<>();
+		persistedQuery.put("version", 1);
+		persistedQuery.put("sha256Hash", query.hash);
+		extensions.put("persistedQuery", persistedQuery);
+		body.put("extensions", extensions);
+		
+		// Convert to JSON string
+		String jsonBody = buildJsonString(body);
+		request.setEntity(new org.apache.http.entity.StringEntity(jsonBody, StandardCharsets.UTF_8));
+		
+		var json = LavaSrcTools.fetchResponseAsJson(sourceManager.getHttpInterface(), request);
+		if (json == null) {
+			throw new RuntimeException("No response from Spotify Partner API");
 		}
-		var transformedSecret = convertArrayToTransformedByteArray(secret);
-		var hexSecret = toHexString(transformedSecret);
-		var totp = generateTOTP(hexSecret, 30, 6);
-		var ts = System.currentTimeMillis();
-		return "https://open.spotify.com/api/token?reason=init&productType=web-player&totp=" + totp + "&totpVer=7&ts=" + ts;
+		
+		if (!json.get("errors").isNull()) {
+			var errors = json.get("errors");
+			throw new RuntimeException("Partner API error: " + errors.format());
+		}
+		
+		return json.get("data");
 	}
 
-	private byte[] requestSecret() throws IOException {
-		String homepageUrl = "https://open.spotify.com/";
-		String scriptPattern = "mobile-web-player";
-
-		log.debug("Requesting secret from Spotify homepage: {}", homepageUrl);
-
-		try (CloseableHttpClient client = HttpClients.createDefault()) {
-			HttpGet request = new HttpGet(homepageUrl);
-			try (CloseableHttpResponse response = client.execute(request)) {
-				String html = EntityUtils.toString(response.getEntity());
-				Document doc = Jsoup.parse(html);
-				Elements scriptElements = doc.select("script[src]");
-				List<String> scriptUrls = new ArrayList<>();
-				log.debug("Found {} script elements in the HTML", scriptElements.size());
-				for (Element script : scriptElements) {
-					String scriptUrl = script.attr("src");
-					if (scriptUrl.contains(scriptPattern) && !scriptUrl.contains("vendor")) {
-						scriptUrls.add(scriptUrl);
-						log.debug("Found relevant script URL: {}", scriptUrl);
-					}
-				}
-				if (scriptUrls.isEmpty()) {
-					log.debug("No relevant script URLs found.");
-					return null;
-				}
-				for (String scriptUrl : scriptUrls) {
-					log.debug("Attempting to extract secret from script URL: {}", scriptUrl);
-					byte[] secret = extractSecret(client, scriptUrl);
-					if (secret != null) {
-						log.debug("Successfully extracted secret.");
-						return secret;
-					}
-				}
-			}
-		} catch (IOException e) {
-			log.error("Failed to request or parse the secret", e);
-			throw new IOException("Failed to request or parse the secret", e);
-		}
-		log.error("No secret found.");
-		return null;
-	}
-
-	private static String generateTOTP(String secret, int period, int digits) {
-		var time = System.currentTimeMillis() / 1000 / period;
-		var buffer = ByteBuffer.allocate(8);
-		buffer.putLong(time);
-		var timeBytes = buffer.array();
-
-		try {
-			var keySpec = new SecretKeySpec(hexStringToByteArray(secret), "HmacSHA1");
-			var mac = Mac.getInstance("HmacSHA1");
-			mac.init(keySpec);
-			var hash = mac.doFinal(timeBytes);
-			var offset = hash[hash.length - 1] & 0xF;
-			var binary = ((hash[offset] & 0x7F) << 24) | ((hash[offset + 1] & 0xFF) << 16) |
-				((hash[offset + 2] & 0xFF) << 8) | (hash[offset + 3] & 0xFF);
-			var otp = binary % (int) Math.pow(10, digits);
-			return String.format("%0" + digits + "d", otp);
-		} catch (NoSuchAlgorithmException | InvalidKeyException e) {
-			throw new RuntimeException("Error generating TOTP", e);
-		}
-	}
-
-	private static byte[] extractSecret(CloseableHttpClient client, String scriptUrl) throws IOException {
-		var scriptRequest = new HttpGet(scriptUrl);
-		try (var scriptResponse = client.execute(scriptRequest)) {
-			var scriptContent = EntityUtils.toString(scriptResponse.getEntity());
-
-			var matcher = SECRET_PATTERN.matcher(scriptContent);
-			if (matcher.find()) {
-				var secretArrayString = matcher.group(1);
-				var secretArray = secretArrayString.split(",");
-				byte[] secretByteArray = new byte[secretArray.length];
-				for (int i = 0; i < secretArray.length; i++) {
-					secretByteArray[i] = (byte) Integer.parseInt(secretArray[i].trim());
-				}
-
-				return secretByteArray;
+	/**
+	 * Simple JSON string builder for the request body
+	 */
+	private String buildJsonString(Map<String, Object> map) {
+		StringBuilder sb = new StringBuilder("{");
+		boolean first = true;
+		
+		for (Map.Entry<String, Object> entry : map.entrySet()) {
+			if (!first) sb.append(",");
+			first = false;
+			
+			sb.append("\"").append(entry.getKey()).append("\":");
+			
+			Object value = entry.getValue();
+			if (value instanceof String) {
+				sb.append("\"").append(value).append("\"");
+			} else if (value instanceof Map) {
+				sb.append(buildJsonString((Map<String, Object>) value));
+			} else if (value instanceof Number) {
+				sb.append(value);
 			} else {
-				log.error("No secret array found in script: {}", scriptUrl);
-				return null;
+				// For other types, use toString
+				sb.append("\"").append(value.toString()).append("\"");
 			}
 		}
+		
+		sb.append("}");
+		return sb.toString();
 	}
 
-	private static byte[] convertArrayToTransformedByteArray(byte[] array) {
-		byte[] transformed = new byte[array.length];
-		for (int i = 0; i < array.length; i++) {
-			// XOR with dat transform
-			transformed[i] = (byte) (array[i] ^ ((i % 33) + 9));
-		}
-		return transformed;
-	}
+	/**
+	 * Query definition for Partner API
+	 */
+	private static class QueryDefinition {
+		final String name;
+		final String hash;
 
-	private static String toHexString(byte[] transformed) {
-		StringBuilder joinedString = new StringBuilder();
-		for (byte b : transformed) {
-			joinedString.append(b);
+		QueryDefinition(String name, String hash) {
+			this.name = name;
+			this.hash = hash;
 		}
-		byte[] utf8Bytes = joinedString.toString().getBytes(StandardCharsets.UTF_8);
-		StringBuilder hexString = new StringBuilder();
-		for (byte b : utf8Bytes) {
-			hexString.append(String.format("%02x", b));
-		}
-		return hexString.toString();
 	}
-
-	private static byte[] hexStringToByteArray(String s) {
-		int len = s.length();
-		byte[] data = new byte[len / 2];
-		for (int i = 0; i < len; i += 2) {
-			data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
-				+ Character.digit(s.charAt(i + 1), 16));
-		}
-		return data;
-	}
-
 }
